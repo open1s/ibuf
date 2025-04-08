@@ -17,7 +17,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-ibuf = { git = "https://github.com/your-repo/ibuf.git" }
+ibuf = { version = "0.2" }
 ```
 
 ### Basic Usage
