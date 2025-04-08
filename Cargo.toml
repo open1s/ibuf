@@ -2,6 +2,8 @@
 name = "ibuf"
 version = "0.2.0"
 edition = "2021"
+authors = ["Brian G"]
+repository = "https://github.com/open1s/ibuf.git"
 description = "A memory buffer pool implementation"
 license = "MIT"
 
