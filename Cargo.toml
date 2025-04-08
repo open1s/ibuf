@@ -1,0 +1,19 @@
+[package]
+name = "ibuf"
+version = "0.1.0"
+edition = "2021"
+description = "A memory buffer pool implementation"
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "mbuf_bench"
+path = "benches/mbuf_bench.rs"
+harness = false
+
+[features]
+default = []
