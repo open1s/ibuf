@@ -22,6 +22,7 @@
 
 #![allow(dead_code)]
 
+use std::borrow::{Borrow, BorrowMut};
 use std::ptr;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,9 +31,9 @@ use std::io::{Read, Write, Result};
 /// 类似Linux mbuf的高性能消息缓冲区
 pub struct MBuf {
     data: *mut u8,
-    len: AtomicUsize,
+    len: usize,
     capacity: usize,
-    ref_count: AtomicUsize,
+    ref_count: *mut AtomicUsize,
 }
 
 impl MBuf {
@@ -40,18 +41,18 @@ impl MBuf {
     pub fn with_capacity(capacity: usize) -> Self {
         let layout = std::alloc::Layout::from_size_align(capacity, 1).unwrap();
         let data = unsafe { std::alloc::alloc(layout) };
-        
+        let ref_count = Box::into_raw(Box::new(AtomicUsize::new(1)));
         Self {
             data,
-            len: AtomicUsize::new(0),
+            len: 0,
             capacity,
-            ref_count: AtomicUsize::new(1),
+            ref_count,
         }
     }
     
     /// 获取当前数据长度
     pub fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
+        self.len
     }
     
     /// 获取缓冲区容量
@@ -59,20 +60,9 @@ impl MBuf {
         self.capacity
     }
     
-    /// 克隆缓冲区，增加引用计数
-    pub fn clone(&self) -> Self {
-        self.ref_count.fetch_add(1, Ordering::Relaxed);
-        Self {
-            data: self.data,
-            len: AtomicUsize::new(self.len.load(Ordering::Relaxed)),
-            capacity: self.capacity,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
-        }
-    }
-    
     /// 追加数据
     pub fn append(&mut self, data: &[u8]) -> usize {
-        let current_len = self.len.load(Ordering::Acquire);
+        let current_len = self.len;
         let needed = current_len + data.len();
         
         if needed > self.capacity {
@@ -88,18 +78,23 @@ impl MBuf {
             );
         }
         
-        self.len.store(current_len + to_copy, Ordering::Release);
+        self.len = current_len + to_copy;
         to_copy
     }
-    
+
+    pub fn is_unique(&self) -> bool {
+        unsafe { (*self.ref_count).load(Ordering::Acquire) == 1 }
+    }
+
+
     /// 调整缓冲区大小
     pub fn resize(&mut self, new_capacity: usize) {
-        let current_len = self.len.load(Ordering::Acquire);
+        let current_len = self.len;
         let new_capacity = std::cmp::max(new_capacity, self.capacity + self.capacity / 2); // 按1.5倍增长
         
         let new_layout = std::alloc::Layout::from_size_align(new_capacity, 1).unwrap();
         let new_data = unsafe { std::alloc::alloc(new_layout) };
-        
+
         unsafe {
             ptr::copy_nonoverlapping(
                 self.data,
@@ -107,27 +102,48 @@ impl MBuf {
                 current_len
             );
             
-            if self.ref_count.load(Ordering::Relaxed) == 1 {
+            //如果只有一个引用，释放旧内存
+            if (*self.ref_count).fetch_sub(1, Ordering::AcqRel) == 1 {
                 let old_layout = std::alloc::Layout::from_size_align(self.capacity, 1).unwrap();
                 std::alloc::dealloc(self.data, old_layout);
+                //释放旧引用
+                drop(Box::from_raw(self.ref_count));
             }
         }
         
         self.data = new_data;
         self.capacity = new_capacity;
+        self.ref_count = Box::into_raw(Box::new(AtomicUsize::new(1)));
     }
 
     pub fn clear(&mut self) {
-        self.len.store(0, Ordering::Release);
+        self.len = 0;
+    }
+}
+
+impl Clone for MBuf {
+    fn clone(&self) -> Self {
+        unsafe {
+            (*self.ref_count).fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            data: self.data,
+            len: self.len,
+            capacity: self.capacity,
+            ref_count: self.ref_count,
+        }
     }
 }
 
 impl Drop for MBuf {
     fn drop(&mut self) {
-        if self.ref_count.load(Ordering::Relaxed) == 1 {
-            let layout = std::alloc::Layout::from_size_align(self.capacity, 1).unwrap();
-            unsafe { std::alloc::dealloc(self.data, layout); }
-        }
+        unsafe {
+            if (*self.ref_count).fetch_sub(1, Ordering::AcqRel) == 1 {
+                let layout = std::alloc::Layout::from_size_align(self.capacity, 1).unwrap();
+                std::alloc::dealloc(self.data, layout);
+                drop(Box::from_raw(self.ref_count));
+            }
+        }  
     }
 }
 
@@ -135,16 +151,41 @@ impl Deref for MBuf {
     type Target = [u8];
     
     fn deref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.data, self.len.load(Ordering::Acquire)) }
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
     }
 }
 
 impl DerefMut for MBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        let len = self.len.load(Ordering::Acquire);
+        let len = self.len;
         unsafe { std::slice::from_raw_parts_mut(self.data, len) }
     }
 }
+
+impl AsRef<[u8]> for MBuf  {
+    fn as_ref(&self) -> &[u8] {
+        &*self
+    }
+}
+
+impl AsMut<[u8]> for MBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut *self
+    }
+}
+
+impl Borrow<[u8]> for MBuf {
+    fn borrow(&self) -> &[u8] {
+        &*self
+    }
+}
+
+impl BorrowMut<[u8]> for MBuf {
+    fn borrow_mut(&mut self) -> &mut [u8] {
+        &mut *self
+    }
+}
+
 
 unsafe impl Send for MBuf {}
 unsafe impl Sync for MBuf {}
@@ -196,7 +237,7 @@ impl<'a> Cursor<'a> {
 
 impl Read for MBuf {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let len = self.len.load(Ordering::Acquire);
+        let len = self.len;
         let to_read = std::cmp::min(buf.len(), len);
         
         unsafe {
@@ -212,7 +253,7 @@ impl Read for MBuf {
             );
         }
         
-        self.len.store(len - to_read, Ordering::Release);
+        self.len = len - to_read;
         Ok(to_read)
     }
 }
@@ -285,5 +326,14 @@ mod tests {
         assert_eq!(written, data.len());
         assert_eq!(buf.len(), data.len());
         assert_eq!(&*buf, data);
+    }
+
+    #[test]
+    fn test_fetch_sub() {
+       let mm = AtomicUsize::new(1); 
+       let q = mm.fetch_sub(1, Ordering::Relaxed);
+       println!("q: {}", q);
+       let q = mm.fetch_sub(1, Ordering::Relaxed);
+       println!("q: {}", q);
     }
 }
